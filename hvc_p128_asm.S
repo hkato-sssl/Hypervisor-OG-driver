@@ -12,7 +12,7 @@
 	.global		hvc_p128_read_u16
 	.global		hvc_p128_read_u32
 	.global		hvc_p128_send_asm
-	.global		hvc_p128_receive_as
+	.global		hvc_p128_receive_asm
 
 	.section	".text.hvc_p128_read_u16", "ax", %progbits
 	.type		hvc_p128_read_u16, %function
