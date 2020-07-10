@@ -21,25 +21,30 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 //static long op_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 struct p128_device {
-	struct module	*owner;
-	struct device	*dev;
-	struct cdev	cdev;
-
-	unsigned int	busy;
-	u16		ifno;
-	u16		interrupt_no;
+	struct device	        *dev;
+	unsigned int	        busy;
+        u32                     status;
+	u16		        ifno;
+	u16		        interrupt_no;
 };
 
 struct p128 {
-	dev_t			major;
+        struct list_head        list;
+
+        dev_t                   major;
+	struct cdev	        cdev;
 	struct class		*class;
+
 	struct {
 		const char	*name;
-		u32		reg;
+		u32		command;
 	} dtb;
+
 	u16			nr_devices;
 	struct p128_device	*devices;
 };
+
+static LIST_HEAD(p128_list);
 
 static const struct of_device_id of_p128[] = {
 	{
@@ -74,6 +79,7 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 static int op_open(struct inode *inode, struct file *file)
 {
 	pr_info("%s()\n", __func__);
+        pr_info("private_data=%p\n", file->private_data);
 
 	return 0;
 }
@@ -85,50 +91,65 @@ static int op_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int register_device(struct platform_device *pdev, struct p128 *p128, u16 ifno)
+static void unregister_device(struct platform_device *pdev, struct p128 *p128, int ifno)
+{
+        dev_t devt;
+        struct p128_device *dev;
+
+        dev = &(p128->devices[ifno]);
+        if (dev->busy) {
+                devt = MKDEV(p128->major, ifno);
+                device_destroy(p128->class, devt);
+                dev->busy = 0;
+        }
+}
+
+static void unregister_devices(struct platform_device *pdev, struct p128 *p128)
+{
+        int i;
+
+        for (i = 0; i < p128->nr_devices; ++i) {
+                unregister_device(pdev, p128, i);
+        }
+}
+
+static int register_device(struct platform_device *pdev, struct p128 *p128, int ifno)
 {
 	int ret;
+        dev_t devt;
 	struct p128_device *dev;
-	dev_t devt;
 
 	dev = &(p128->devices[ifno]);
 	if (dev->busy) {
-		pr_err("%s#%u is busy\n", p128->dtb.name, ifno);
+		pr_err("%s%u is busy\n", p128->dtb.name, ifno);
 		return -EBUSY;
 	}
 
-	ret = hvc_p128_get_interrupt_no(p128->dtb.reg, ifno, &(dev->interrupt_no));
+	ret = hvc_p128_get_interrupt_no(p128->dtb.command, ifno, &(dev->interrupt_no));
 	if (ret) {
 		pr_err("hvc_p128_get_interrupt_no(%s%u) -> %d.\n", p128->dtb.name, ifno, ret);
 		return ret;
 	}
 
-	cdev_init(&(dev->cdev), &file_ops);
-	dev->cdev.owner = THIS_MODULE;
-	devt = MKDEV(p128->major, ifno);
-	ret = cdev_add(&(dev->cdev), devt, 1);
+        ret = hvc_p128_get_status(p128->dtb.command, ifno, &(dev->status));
 	if (ret) {
-		pr_err("cdev_add() -> %d\n", ret);
+		pr_err("hvc_p128_get_status(%s%u) -> %d.\n", p128->dtb.name, ifno, ret);
 		return ret;
 	}
 
+        devt = MKDEV(p128->major, (BASE_MINOR + ifno));
 	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s%d", p128->dtb.name, ifno);
+        pr_info("device_create(%s%u, %p)\n", p128->dtb.name, ifno, dev);
 	if (IS_ERR(dev->dev)) {
 		pr_err("unable to create device %s%d\n", p128->dtb.name, ifno);
 		ret = PTR_ERR(dev->dev);
-		goto error1;
+                return ret;
 	}
-	dev_set_drvdata(dev->dev, dev);
 
 	dev->busy = 1;
-	pr_info("%s%d is added\n", p128->dtb.name, ifno);
+	pr_info("%s%d is added.\n", p128->dtb.name, ifno);
 
 	return 0;
-
-error1:
-	cdev_del(&(dev->cdev));
-
-	return ret;
 }
 
 static int register_devices(struct platform_device *pdev, struct p128 *p128)
@@ -139,105 +160,83 @@ static int register_devices(struct platform_device *pdev, struct p128 *p128)
 	for (i = 0; i < p128->nr_devices; ++i) {
 		ret = register_device(pdev, p128, i);
 		if (ret) {
-			break;
+                        unregister_devices(pdev, p128);
+                        break;
 		}
 	}
 
 	return ret;
 }
 
-static int unregister_device(struct p128 *p128, unsigned int ifno)
-{
-	struct p128_device *dev;
-
-	if (ifno >= p128->nr_devices) {
-		pr_err("Invalid I/F No.(%u)\n", ifno);
-		return -EINVAL;
-	}
-	dev = &(p128->devices[ifno]);
-
-	if (dev->busy == 0) {
-		return 0;	/* no work */
-	}
-
-	dev->busy = 0;
-
-	device_destroy(p128->class, dev->dev->devt);
-	cdev_del(&(dev->cdev));
-	dev->busy = 0;
-
-	return 0;
-}
-
-static struct p128 *create_resources(const char *name, u32 reg)
+static struct p128 *create_resources(struct platform_device *pdev, const char *name, u32 command, u16 nr_ifs)
 {
 	int ret;
-	u16 nr_ifs;
-	dev_t dev;
-	struct p128 *p;
+        dev_t devt;
+	struct p128 *p128;
 
 	/* get the parameter from the hypervisor */
 
-	ret = hvc_p128_nr_interfaces(reg, &nr_ifs);
-	pr_info("# of I/Fs: %d\n", nr_ifs);
-	if (nr_ifs == 0) {
-		return ERR_PTR(-ENODEV);
-	}
-
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
-	if (p == NULL) {
+	p128 = kzalloc(sizeof(*p128), GFP_KERNEL);
+	if (p128 == NULL) {
 		return ERR_PTR(-ENOMEM);
 	}
 
-	p->devices = kcalloc(nr_ifs, sizeof(struct p128_device), GFP_KERNEL);
-	if (p->devices == NULL) {
+	p128->devices = kcalloc(nr_ifs, sizeof(struct p128_device), GFP_KERNEL);
+	if (p128->devices == NULL) {
 		ret = -ENOMEM;
 		goto error0;
 	}
 
-	p->dtb.name = name;
-	p->dtb.reg = reg;
-	p->nr_devices = nr_ifs;
+	p128->dtb.name = name;
+	p128->dtb.command = command;
+	p128->nr_devices = nr_ifs;
 
-	ret = alloc_chrdev_region(&dev, BASE_MINOR, nr_ifs, name);
+	ret = alloc_chrdev_region(&devt, BASE_MINOR, nr_ifs, name);
 	if (ret != 0) {
 		pr_err("alloc_chrdev_region() -> %d\n", ret);
-		goto error0;
-	}
-
-	p->major = MAJOR(dev);
-
-	p->class = class_create(THIS_MODULE, name);
-	if (IS_ERR(p->class)) {
-		ret = PTR_ERR(p->class);
-		pr_err("class_create() -> %d.\n", ret);
 		goto error1;
 	}
 
-	return p;
+        p128->major = MAJOR(devt);
 
+	p128->class = class_create(THIS_MODULE, name);
+	if (IS_ERR(p128->class)) {
+		ret = PTR_ERR(p128->class);
+		pr_err("class_create() -> %d.\n", ret);
+		goto error2;
+	}
+
+	cdev_init(&(p128->cdev), &file_ops);
+	p128->cdev.owner = THIS_MODULE;
+        devt = MKDEV(p128->major, BASE_MINOR);
+	ret = cdev_add(&(p128->cdev), devt, nr_ifs);
+	if (ret) {
+		pr_err("cdev_add() -> %d\n", ret);
+		goto error3;
+        }
+
+	return p128;
+
+error3:
+        class_destroy(p128->class);
+error2:
+        devt = MKDEV(p128->major, BASE_MINOR);
+	unregister_chrdev_region(devt, nr_ifs);
 error1:
-	dev = MKDEV(p->major, BASE_MINOR);
-	unregister_chrdev_region(dev, nr_ifs);
-	kfree(p->devices);
+	kfree(p128->devices);
 error0:
-	kfree(p);
+	kfree(p128);
 
 	return ERR_PTR(ret);
 }
 
 static int free_resources(struct p128 *p128)
 {
-	unsigned int i;
-	dev_t dev;
-
-	for (i = 0; i < p128->nr_devices; ++i) {
-		unregister_device(p128, i);
-	}
+	dev_t devt;
 
 	class_destroy(p128->class);
-	dev = MKDEV(p128->major, BASE_MINOR);
-	unregister_chrdev_region(dev, p128->nr_devices);
+	devt = MKDEV(p128->major, BASE_MINOR);
+	unregister_chrdev_region(devt, p128->nr_devices);
 
 	kfree(p128->devices);
 	kfree(p128);
@@ -245,50 +244,37 @@ static int free_resources(struct p128 *p128)
 	return 0;
 }
 
-static int probe(struct platform_device *pdev)
+static int probe(struct platform_device *pdev, const char *name, u32 command)
 {
 	int ret;
-	u32 reg;
-	const char *name;
-	struct device *dev;
-	struct fwnode_handle *child;
+        u16 nr_ifs;
 	struct p128 *p128;
 
-	ret = -ENODEV;
-	dev = &(pdev->dev);
-	device_for_each_child_node(dev, child) {
-		if (fwnode_property_present(child, "reg")) {
-			fwnode_property_read_u32(child, "reg", &reg);
-			pr_info("reg=0x%08x\n", reg);
-		} else {
-			pr_err("property \"reg\" is not available.\n");
-			ret = -EINVAL;
-			break;
-		}
+        ret = hvc_p128_nr_interfaces(command, &nr_ifs);
+        if (ret) {
+                pr_err("hvcs_p128_nr_interfaces(%s<0x%08x>) -> %d\n", name, command, ret);
+                return -ENODEV;         /* override the error code */
+        }
 
-		if (fwnode_property_present(child, "name")) {
-			fwnode_property_read_string(child, "name", &name);
-			pr_info("name=%s\n", name);
-		} else {
-			pr_err("property \"name\" is not available.\n");
-			ret = -EINVAL;
-			break;
-		}
+        pr_info("%s: # of I/F = %d.\n", name, nr_ifs);
+        if (nr_ifs == 0) {
+                return -ENODEV;
+        }
 
-		p128 = create_resources(name, reg);
-		if (IS_ERR(p128)) {
-			ret = PTR_ERR(p128);
-			break;
-		}
+        p128 = create_resources(pdev, name, command, nr_ifs);
+        if (IS_ERR(p128)) {
+                return PTR_ERR(p128);
+        }
 
-		ret = register_devices(pdev, p128);
-		if (ret != 0) {
-			free_resources(p128);
-			break;
-		}
-
-		platform_set_drvdata(pdev, p128);
+	ret = register_devices(pdev, p128);
+	if (ret != 0) {
+		free_resources(p128);
+		return ret;
 	}
+        pr_info("@@@\n");
+
+        list_add_tail(&(p128->list), &p128_list);
+        pr_info("@@@\n");
 
 	return ret;
 }
@@ -296,15 +282,40 @@ static int probe(struct platform_device *pdev)
 static int p128_probe(struct platform_device *pdev)
 {
 	int ret;
+        u32 command;
+        const char *name;
+	struct fwnode_handle *fh;
 
-	ret = probe(pdev);
+        pr_info("pdev=%p\n", pdev);
+
+        fh = dev_fwnode(&(pdev->dev));
+        ret = fwnode_property_read_string(fh, "name", &name);
+        if (ret) {
+		pr_err("property \"name\" is not available.\n");
+                return ret;
+        }
+
+        ret = fwnode_property_read_u32_array(fh, "command", &command, 1);
+        if (ret) {
+		pr_err("property \"command\" is not available.\n");
+                return ret;
+        }
+
+        ret = probe(pdev, name, command);
 
 	return ret;
 }
 
 static int p128_remove(struct platform_device *pdev)
 {
-	free_resources(platform_get_drvdata(pdev));
+        struct p128 *p128;
+
+        while (! list_empty(&p128_list)) {
+                p128 = list_first_entry(&p128_list, struct p128, list);
+                unregister_devices(pdev, p128);
+                free_resources(p128);
+                list_del(&(p128->list));
+        }
 
 	return 0;
 }
