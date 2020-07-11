@@ -22,8 +22,8 @@
 
 int hvc_p128_read_u16(u64 ip0, u16 *p);
 int hvc_p128_read_u32(u64 ip0, u32 *p);
-int hvc_p128_send_asm(u64 ip0, const char *buff);
-int hvc_p128_receive_asm(u64 ip0, char *buff);
+int hvc_p128_send_asm(u64 ip0, const void *buff);
+int hvc_p128_receive_asm(u64 ip0, void *buff);
 
 /* variables */
 
@@ -71,7 +71,7 @@ int hvc_p128_get_status(u32 id, u16 ifno, u32 *status)
 	return ret;
 }
 
-int hvc_p128_send(u32 id, u16 ifno, const char *buff)
+int hvc_p128_send(u32 id, u16 ifno, const void *buff)
 {
 	int ret;
 	u64 ip0;
@@ -82,7 +82,7 @@ int hvc_p128_send(u32 id, u16 ifno, const char *buff)
 	return ret;
 }
 
-int hvc_p128_receive(u32 id, u16 ifno, char *buff)
+int hvc_p128_receive(u32 id, u16 ifno, void *buff)
 {
 	int ret;
 	u64 ip0;
