@@ -11,8 +11,11 @@
 #include <linux/property.h>
 #include "hvc_p128.h"
 
-#define DRIVER_NAME	"hvcs-p128"
-#define BASE_MINOR	0
+#define DRIVER_NAME		"hvcs-p128"
+#define BASE_MINOR		0
+
+#define P128_STS_TX_EMPTY	(1UL << 1)
+#define P128_STS_DATA_READY	(1UL)
 
 static int op_open(struct inode *inode, struct file *file);
 static int op_release(struct inode *inode, struct file *file);
@@ -24,8 +27,11 @@ struct p128_device {
 	struct device		*dev;
 	unsigned int		busy;
 	u32			status;
+	u32			id;
 	u16			ifno;
 	u16			interrupt_no;
+	struct semaphore	rsem;
+	struct semaphore	wsem;
 };
 
 struct p128 {
@@ -37,7 +43,7 @@ struct p128 {
 
 	struct {
 		const char	*name;
-		u32		command;
+		u32		id;
 	} dtb;
 
 	u16			nr_devices;
@@ -81,21 +87,68 @@ static struct p128 *find_p128(dev_t dev)
 
 static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 {
-	pr_info("%s()\n", __func__);
+	ssize_t ret;
+	struct p128_device *dev;
+	uint64_t tmp[16];
 
-	return 0;
+	pr_info("%s(buff=%p, count=%lu)\n", __func__, buff, count);
+	dev = file->private_data;
+
+	if (count >= 128) {
+		ret = hvc_p128_receive(dev->id, dev->ifno, buff);
+		if (ret == 0) {
+			ret = 128;
+		} else {
+			ret = -ENODATA;
+		}
+	} else {
+		ret = hvc_p128_receive(dev->id, dev->ifno, tmp);
+		if (ret == 0) {
+			memcpy(buff, tmp, count);
+			ret = count;
+		} else {
+			ret = -ENODATA;
+		}
+	}
+
+	return ret;
 }
 
 static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_t *pos)
 {
-	pr_info("%s()\n", __func__);
+	ssize_t ret;
+	struct p128_device *dev;
+	uint64_t tmp[16];
 
-	return count;
+	pr_info("%s(buff=%p, count=%lu)\n", __func__, buff, count);
+	dev = file->private_data;
+
+	if (count >= 128) {
+		ret = hvc_p128_send(dev->id, dev->ifno, buff);
+		if (ret) {
+			ret = -ENODEV;
+		} else {
+			ret = 128;
+		}
+	} else {
+		memset(tmp, 0, sizeof(tmp));
+		memcpy(tmp, buff, count);
+		ret = hvc_p128_send(dev->id, dev->ifno, buff);
+		if (ret) {
+			ret = -ENODEV;
+		} else {
+			ret = count;
+		}
+	} 
+
+	return ret;
 }
 
 static int op_open(struct inode *inode, struct file *file)
 {
+	int ret;
 	struct p128 *p128;
+	struct p128_device *dev;
 
 	pr_info("%s()\n", __func__);
 	pr_info("%u,%u\n", MAJOR(inode->i_cdev->dev), MINOR(inode->i_cdev->dev));
@@ -105,7 +158,15 @@ static int op_open(struct inode *inode, struct file *file)
 	pr_info("p128 = %p\n", p128);
 	pr_info("p128_device = %p\n", p128->devices + MINOR(inode->i_rdev));
 
-	return 0;
+	if (p128) {
+		dev = p128->devices + (MINOR(inode->i_rdev) - MINOR(inode->i_cdev->dev));
+		file->private_data = dev;
+		ret = 0;
+	} else {
+		ret = -ENODEV;
+	}
+
+	return ret;
 }
 
 static int op_release(struct inode *inode, struct file *file)
@@ -140,6 +201,7 @@ static void unregister_devices(struct platform_device *pdev, struct p128 *p128)
 static int register_device(struct platform_device *pdev, struct p128 *p128, int ifno)
 {
 	int ret;
+	int v;
 	dev_t devt;
 	struct p128_device *dev;
 
@@ -149,17 +211,26 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 		return -EBUSY;
 	}
 
-	ret = hvc_p128_get_interrupt_no(p128->dtb.command, ifno, &(dev->interrupt_no));
+	dev->id = p128->dtb.id;
+	dev->ifno = ifno;
+
+	ret = hvc_p128_get_interrupt_no(p128->dtb.id, ifno, &(dev->interrupt_no));
 	if (ret) {
 		pr_err("hvc_p128_get_interrupt_no(%s%u) -> %d.\n", p128->dtb.name, ifno, ret);
 		return ret;
 	}
 
-	ret = hvc_p128_get_status(p128->dtb.command, ifno, &(dev->status));
+	ret = hvc_p128_get_status(p128->dtb.id, ifno, &(dev->status));
 	if (ret) {
 		pr_err("hvc_p128_get_status(%s%u) -> %d.\n", p128->dtb.name, ifno, ret);
 		return ret;
 	}
+
+	v = (dev->status & P128_STS_DATA_READY) ? 1 : 0;
+	sema_init(&(dev->rsem), v);
+
+	v = (dev->status & P128_STS_TX_EMPTY) ? 1 : 0;
+	sema_init(&(dev->wsem), v);
 
 	devt = MKDEV(p128->major, (BASE_MINOR + ifno));
 	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s%d", p128->dtb.name, ifno);
@@ -192,7 +263,7 @@ static int register_devices(struct platform_device *pdev, struct p128 *p128)
 	return ret;
 }
 
-static struct p128 *create_resources(struct platform_device *pdev, const char *name, u32 command, u16 nr_ifs)
+static struct p128 *create_resources(struct platform_device *pdev, const char *name, u32 id, u16 nr_ifs)
 {
 	int ret;
 	dev_t devt;
@@ -212,7 +283,7 @@ static struct p128 *create_resources(struct platform_device *pdev, const char *n
 	}
 
 	p128->dtb.name = name;
-	p128->dtb.command = command;
+	p128->dtb.id = id;
 	p128->nr_devices = nr_ifs;
 
 	ret = alloc_chrdev_region(&devt, BASE_MINOR, nr_ifs, name);
@@ -268,15 +339,15 @@ static int free_resources(struct p128 *p128)
 	return 0;
 }
 
-static int probe(struct platform_device *pdev, const char *name, u32 command)
+static int probe(struct platform_device *pdev, const char *name, u32 id)
 {
 	int ret;
 	u16 nr_ifs;
 	struct p128 *p128;
 
-	ret = hvc_p128_nr_interfaces(command, &nr_ifs);
+	ret = hvc_p128_nr_interfaces(id, &nr_ifs);
 	if (ret) {
-		pr_err("hvcs_p128_nr_interfaces(%s<0x%08x>) -> %d\n", name, command, ret);
+		pr_err("hvcs_p128_nr_interfaces(%s<0x%08x>) -> %d\n", name, id, ret);
 		return -ENODEV;		/* override the error code */
 	}
 
@@ -285,7 +356,7 @@ static int probe(struct platform_device *pdev, const char *name, u32 command)
 		return -ENODEV;
 	}
 
-	p128 = create_resources(pdev, name, command, nr_ifs);
+	p128 = create_resources(pdev, name, id, nr_ifs);
 	if (IS_ERR(p128)) {
 		return PTR_ERR(p128);
 	}
@@ -305,7 +376,7 @@ static int probe(struct platform_device *pdev, const char *name, u32 command)
 static int p128_probe(struct platform_device *pdev)
 {
 	int ret;
-	u32 command;
+	u32 id;
 	const char *name;
 	struct fwnode_handle *fh;
 
@@ -318,13 +389,13 @@ static int p128_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = fwnode_property_read_u32_array(fh, "command", &command, 1);
+	ret = fwnode_property_read_u32_array(fh, "device-id", &id, 1);
 	if (ret) {
-		pr_err("property \"command\" is not available.\n");
+		pr_err("property \"device-id\" is not available.\n");
 		return ret;
 	}
 
-	ret = probe(pdev, name, command);
+	ret = probe(pdev, name, id);
 
 	return ret;
 }
