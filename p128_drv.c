@@ -99,7 +99,7 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 		if (ret == 0) {
 			ret = 128;
 		} else {
-			ret = -ENODATA;
+			ret = 0;
 		}
 	} else {
 		ret = hvc_p128_receive(dev->id, dev->ifno, tmp);
@@ -107,7 +107,7 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 			memcpy(buff, tmp, count);
 			ret = count;
 		} else {
-			ret = -ENODATA;
+			ret = 0;
 		}
 	}
 
@@ -133,7 +133,7 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 	} else {
 		memset(tmp, 0, sizeof(tmp));
 		memcpy(tmp, buff, count);
-		ret = hvc_p128_send(dev->id, dev->ifno, buff);
+		ret = hvc_p128_send(dev->id, dev->ifno, tmp);
 		if (ret) {
 			ret = -ENODEV;
 		} else {
