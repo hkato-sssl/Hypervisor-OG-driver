@@ -13,6 +13,7 @@
 #define P128_CMD_NI		P128_CMD('N', 'I')
 #define P128_CMD_GI		P128_CMD('G', 'I')
 #define P128_CMD_GS		P128_CMD('G', 'S')
+#define P128_CMD_GE		P128_CMD('G', 'E')
 #define P128_CMD_WR		P128_CMD('W', 'R')
 #define P128_CMD_RD		P128_CMD('R', 'D')
 
@@ -67,6 +68,17 @@ int hvc_p128_get_status(u32 id, u16 ifno, u32 *status)
 
 	ip0 = hvc_command_id(id, P128_CMD_GS, ifno);
 	ret = hvc_p128_read_u32(ip0, status);
+
+	return ret;
+}
+
+int hvc_p128_get_event(u32 id, u16 ifno, u32 *event)
+{
+	int ret;
+	u64 ip0;
+
+	ip0 = hvc_command_id(id, P128_CMD_GE, ifno);
+	ret = hvc_p128_read_u32(ip0, event);
 
 	return ret;
 }
