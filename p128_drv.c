@@ -9,13 +9,14 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/property.h>
+#include <linux/interrupt.h>
 #include "hvc_p128.h"
 
 #define DRIVER_NAME		"hvcs-p128"
 #define BASE_MINOR		0
 
-#define P128_STS_TX_EMPTY	(1UL << 1)
 #define P128_STS_DATA_READY	(1UL)
+#define P128_STS_TX_EMPTY	(1UL << 1)
 
 static int op_open(struct inode *inode, struct file *file);
 static int op_release(struct inode *inode, struct file *file);
@@ -26,10 +27,9 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 struct p128_device {
 	struct device		*dev;
 	unsigned int		busy;
-	u32			status;
 	u32			id;
 	u16			ifno;
-	u16			interrupt_no;
+	u16			irq;
 	struct semaphore	rsem;
 	struct semaphore	wsem;
 };
@@ -41,10 +41,8 @@ struct p128 {
 	struct cdev		cdev;
 	struct class		*class;
 
-	struct {
-		const char	*name;
-		u32		id;
-	} dtb;
+	const char	*name;
+	u32		id;
 
 	u16			nr_devices;
 	struct p128_device	*devices;
@@ -85,6 +83,34 @@ static struct p128 *find_p128(dev_t dev)
 	return NULL;
 }
 
+static irqreturn_t irq_handler(int irq, void *dev_id)
+{
+	int ret;
+	u32 event;
+	struct p128_device *dev;
+
+	pr_info("%s(irq=%d)\n", __func__, irq);
+
+	dev = dev_id;
+	ret = hvc_p128_get_event(dev->id, dev->ifno, &event);
+	if (ret) {
+		pr_err("hvc_p128_get_event(id=%08x, ifno=%u) -> %d\n", dev->id, dev->ifno, ret);
+		return IRQ_NONE;
+	}
+
+	pr_info("event=0x%08x\n", event);
+
+	if (event & P128_STS_DATA_READY) {
+		up(&(dev->rsem));
+	}
+
+	if (event & P128_STS_TX_EMPTY) {
+		up(&(dev->wsem));
+	}
+
+	return IRQ_HANDLED;
+}
+
 static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 {
 	ssize_t ret;
@@ -93,6 +119,11 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 
 	pr_info("%s(buff=%p, count=%lu)\n", __func__, buff, count);
 	dev = file->private_data;
+
+	ret = down_interruptible(&(dev->rsem));
+	if (ret) {
+		return ret;
+	}
 
 	if (count >= 128) {
 		ret = hvc_p128_receive(dev->id, dev->ifno, buff);
@@ -122,6 +153,11 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 
 	pr_info("%s(buff=%p, count=%lu)\n", __func__, buff, count);
 	dev = file->private_data;
+
+	ret = down_interruptible(&(dev->wsem));
+	if (ret) {
+		return ret;
+	}
 
 	if (count >= 128) {
 		ret = hvc_p128_send(dev->id, dev->ifno, buff);
@@ -202,47 +238,61 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 {
 	int ret;
 	int v;
+	u32 event;
+	u32 status;
 	dev_t devt;
 	struct p128_device *dev;
 
 	dev = &(p128->devices[ifno]);
 	if (dev->busy) {
-		pr_err("%s%u is busy\n", p128->dtb.name, ifno);
+		pr_err("%s%u is busy\n", p128->name, ifno);
 		return -EBUSY;
 	}
 
-	dev->id = p128->dtb.id;
+	dev->id = p128->id;
 	dev->ifno = ifno;
+	dev->irq = platform_get_irq(pdev, ifno);
+	pr_info("irq=%u\n", dev->irq);
 
-	ret = hvc_p128_get_interrupt_no(p128->dtb.id, ifno, &(dev->interrupt_no));
+	ret = hvc_p128_get_status(p128->id, ifno, &status);
 	if (ret) {
-		pr_err("hvc_p128_get_interrupt_no(%s%u) -> %d.\n", p128->dtb.name, ifno, ret);
+		pr_err("hvc_p128_get_status(%s%u) -> %d.\n", p128->name, ifno, ret);
 		return ret;
 	}
+	pr_info("current status:0x%08x\n", status);
 
-	ret = hvc_p128_get_status(p128->dtb.id, ifno, &(dev->status));
+	ret = hvc_p128_get_event(p128->id, ifno, &event);
 	if (ret) {
-		pr_err("hvc_p128_get_status(%s%u) -> %d.\n", p128->dtb.name, ifno, ret);
+		pr_err("hvc_p128_get_event(%s%u) -> %d.\n", p128->name, ifno, ret);
 		return ret;
 	}
+	pr_info("current event:0x%08x\n", event);
+	status |= event;
 
-	v = (dev->status & P128_STS_DATA_READY) ? 1 : 0;
+	v = (status & P128_STS_DATA_READY) ? 1 : 0;
 	sema_init(&(dev->rsem), v);
 
-	v = (dev->status & P128_STS_TX_EMPTY) ? 1 : 0;
+	v = (status & P128_STS_TX_EMPTY) ? 1 : 0;
 	sema_init(&(dev->wsem), v);
 
 	devt = MKDEV(p128->major, (BASE_MINOR + ifno));
-	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s%d", p128->dtb.name, ifno);
-	pr_info("device_create(%s%u, %p)\n", p128->dtb.name, ifno, dev);
+	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s%d", p128->name, ifno);
+	pr_info("device_create(%s%u, %p)\n", p128->name, ifno, dev);
 	if (IS_ERR(dev->dev)) {
-		pr_err("unable to create device %s%d\n", p128->dtb.name, ifno);
+		pr_err("unable to create device %s%d\n", p128->name, ifno);
 		ret = PTR_ERR(dev->dev);
 		return ret;
 	}
 
+	ret = devm_request_irq(dev->dev, dev->irq, irq_handler, IRQF_TRIGGER_RISING, p128->name, dev);
+	if (ret) {
+		pr_err("devm_request_irq(irq=%d) -> %d\n", dev->irq, ret);
+		return ret;
+	}
+
 	dev->busy = 1;
-	pr_info("%s%d is added.\n", p128->dtb.name, ifno);
+
+	pr_info("%s%d is added.\n", p128->name, ifno);
 
 	return 0;
 }
@@ -282,8 +332,8 @@ static struct p128 *create_resources(struct platform_device *pdev, const char *n
 		goto error0;
 	}
 
-	p128->dtb.name = name;
-	p128->dtb.id = id;
+	p128->name = name;
+	p128->id = id;
 	p128->nr_devices = nr_ifs;
 
 	ret = alloc_chrdev_region(&devt, BASE_MINOR, nr_ifs, name);
