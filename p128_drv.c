@@ -38,6 +38,7 @@ struct p128 {
 	struct list_head	list;
 
 	dev_t			major;
+	dev_t			minor;
 	struct cdev		cdev;
 	struct class		*class;
 
@@ -69,13 +70,13 @@ static struct file_operations file_ops = {
 static struct p128 *find_p128(dev_t dev)
 {
 	unsigned int major;
-	unsigned int n;
+	unsigned int minor;
 	struct p128 *p128;
 
 	major = MAJOR(dev);
-	n = MINOR(dev) - BASE_MINOR;
+	minor = MINOR(dev);
 	list_for_each_entry(p128, &p128_list, list) {
-		if ((major == p128->major) && (n < p128->nr_devices)) {
+		if ((major == p128->major) && (minor >= p128->minor) && (minor < (p128->minor + p128->nr_devices))) {
 			return p128;
 		}
 	}
@@ -219,7 +220,7 @@ static void unregister_device(struct platform_device *pdev, struct p128 *p128, i
 
 	dev = &(p128->devices[ifno]);
 	if (dev->busy) {
-		devt = MKDEV(p128->major, ifno);
+		devt = MKDEV(p128->major, (p128->minor + ifno));
 		device_destroy(p128->class, devt);
 		dev->busy = 0;
 	}
@@ -234,13 +235,12 @@ static void unregister_devices(struct platform_device *pdev, struct p128 *p128)
 	}
 }
 
-static int register_device(struct platform_device *pdev, struct p128 *p128, int ifno)
+static int initialize_device(struct platform_device *pdev, struct p128 *p128, int ifno)
 {
 	int ret;
 	int v;
 	u32 event;
 	u32 status;
-	dev_t devt;
 	struct p128_device *dev;
 
 	dev = &(p128->devices[ifno]);
@@ -252,21 +252,21 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 	dev->id = p128->id;
 	dev->ifno = ifno;
 	dev->irq = platform_get_irq(pdev, ifno);
-	pr_info("irq=%u\n", dev->irq);
+	pr_debug("%s%u.irq=%u\n", p128->name, ifno, dev->irq);
 
 	ret = hvc_p128_get_status(p128->id, ifno, &status);
 	if (ret) {
 		pr_err("hvc_p128_get_status(%s%u) -> %d.\n", p128->name, ifno, ret);
 		return ret;
 	}
-	pr_info("current status:0x%08x\n", status);
+	pr_debug("%s%u.status=0x%08x\n", p128->name, ifno, status);
 
 	ret = hvc_p128_get_event(p128->id, ifno, &event);
 	if (ret) {
 		pr_err("hvc_p128_get_event(%s%u) -> %d.\n", p128->name, ifno, ret);
 		return ret;
 	}
-	pr_info("current event:0x%08x\n", event);
+	pr_debug("%s%u.event=0x%08x\n", p128->name, ifno, event);
 	status |= event;
 
 	v = (status & P128_STS_DATA_READY) ? 1 : 0;
@@ -275,9 +275,23 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 	v = (status & P128_STS_TX_EMPTY) ? 1 : 0;
 	sema_init(&(dev->wsem), v);
 
-	devt = MKDEV(p128->major, (BASE_MINOR + ifno));
+    return 0;
+}
+
+static int register_device(struct platform_device *pdev, struct p128 *p128, int ifno)
+{
+	int ret;
+	dev_t devt;
+	struct p128_device *dev;
+
+	ret = initialize_device(pdev, p128, ifno);
+	if (ret) {
+		return ret;
+	}
+
+	devt = MKDEV(p128->major, (p128->minor + ifno));
+	dev = &(p128->devices[ifno]);
 	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s%d", p128->name, ifno);
-	pr_info("device_create(%s%u, %p)\n", p128->name, ifno, dev);
 	if (IS_ERR(dev->dev)) {
 		pr_err("unable to create device %s%d\n", p128->name, ifno);
 		ret = PTR_ERR(dev->dev);
@@ -292,7 +306,7 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 
 	dev->busy = 1;
 
-	pr_info("%s%d is added.\n", p128->name, ifno);
+	pr_debug("%s%d is registered.\n", p128->name, ifno);
 
 	return 0;
 }
@@ -343,6 +357,7 @@ static struct p128 *create_resources(struct platform_device *pdev, const char *n
 	}
 
 	p128->major = MAJOR(devt);
+	p128->minor = MINOR(devt);
 
 	p128->class = class_create(THIS_MODULE, name);
 	if (IS_ERR(p128->class)) {
@@ -353,7 +368,6 @@ static struct p128 *create_resources(struct platform_device *pdev, const char *n
 
 	cdev_init(&(p128->cdev), &file_ops);
 	p128->cdev.owner = THIS_MODULE;
-	devt = MKDEV(p128->major, BASE_MINOR);
 	ret = cdev_add(&(p128->cdev), devt, nr_ifs);
 	if (ret) {
 		pr_err("cdev_add() -> %d\n", ret);
@@ -365,7 +379,6 @@ static struct p128 *create_resources(struct platform_device *pdev, const char *n
 error3:
 	class_destroy(p128->class);
 error2:
-	devt = MKDEV(p128->major, BASE_MINOR);
 	unregister_chrdev_region(devt, nr_ifs);
 error1:
 	kfree(p128->devices);
@@ -380,7 +393,7 @@ static int free_resources(struct p128 *p128)
 	dev_t devt;
 
 	class_destroy(p128->class);
-	devt = MKDEV(p128->major, BASE_MINOR);
+	devt = MKDEV(p128->major, p128->minor);
 	unregister_chrdev_region(devt, p128->nr_devices);
 
 	kfree(p128->devices);
