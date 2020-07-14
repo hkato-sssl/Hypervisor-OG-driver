@@ -347,7 +347,7 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 		return err;
 	}
 
-	err = devm_request_irq(dev->dev, dev->irq, irq_handler, IRQF_TRIGGER_RISING, p128->name, dev);
+	err = devm_request_irq(dev->dev, dev->irq, irq_handler, IRQF_TRIGGER_HIGH, p128->name, dev);
 	if (err) {
 		pr_err("devm_request_irq(irq=%d) -> %d\n", dev->irq, err);
 		return err;
