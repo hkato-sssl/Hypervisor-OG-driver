@@ -35,17 +35,17 @@ struct p128_device {
 	u32			id;
 	u16			ifno;
 	u16			irq;
-        struct {
-                char            data_ready;
-                char            tx_empty;
-        } status;
+	struct {
+		char		data_ready;
+		char		tx_empty;
+	} status;
 
-	struct mutex	        rmux;
-	struct mutex	        wmux;
-        struct wait_queue_head  rwtq;
-        struct wait_queue_head  wwtq;
-        spinlock_t              rlock;
-        spinlock_t              wlock;
+	struct mutex		rmux;
+	struct mutex		wmux;
+	struct wait_queue_head	rwtq;
+	struct wait_queue_head	wwtq;
+	spinlock_t		rlock;
+	spinlock_t		wlock;
 };
 
 struct p128 {
@@ -56,8 +56,8 @@ struct p128 {
 	struct cdev		cdev;
 	struct class		*class;
 
-	const char	        *name;
-	u32		        id;
+	const char		*name;
+	u32			id;
 
 	u16			nr_devices;
 	struct p128_device	*devices;
@@ -79,7 +79,7 @@ static struct file_operations file_ops = {
 	.release = op_release,
 	.read = op_read,
 	.write = op_write,
-        .poll = op_poll,
+	.poll = op_poll,
 };
 
 static struct p128 *find_p128(dev_t dev)
@@ -125,25 +125,25 @@ static int op_release(struct inode *inode, struct file *file)
 static irqreturn_t irq_handler(int irq, void *dev_id)
 {
 	int err;
-	u32 event;
+	u32 status;
 	struct p128_device *dev;
 
 	dev = dev_id;
-	err = hvc_p128_get_event(dev->id, dev->ifno, &event);
+	err = hvc_p128_get_status(dev->id, dev->ifno, &status);
 	if (err) {
-		pr_err("hvc_p128_get_event(id=%08x, ifno=%u) -> %d\n", dev->id, dev->ifno, err);
+		pr_err("hvc_p128_get_status(id=%08x, ifno=%u) -> %d\n", dev->id, dev->ifno, err);
 		return IRQ_NONE;
 	}
 
-	if (event & P128_STS_DATA_READY) {
-                dev->status.data_ready = 1;
-                wmb();
+	if ((status & P128_STS_DATA_READY) && (! dev->status.data_ready)) {
+		dev->status.data_ready = 1;
+		wmb();
 		wake_up(&(dev->rwtq));
 	}
 
-	if (event & P128_STS_TX_EMPTY) {
-                dev->status.tx_empty = 1;
-                wmb();
+	if ((status & P128_STS_TX_EMPTY) && (! dev->status.tx_empty)) {
+		dev->status.tx_empty = 1;
+		wmb();
 		wake_up(&(dev->wwtq));
 	}
 
@@ -153,7 +153,7 @@ static irqreturn_t irq_handler(int irq, void *dev_id)
 static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 {
 	ssize_t err;
-        unsigned long flags;
+	unsigned long flags;
 	uint64_t tmp[16];
 	struct p128_device *dev;
 
@@ -162,39 +162,39 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 	if (err)
 		return err;
 
-        err = wait_event_interruptible(dev->rwtq, dev->status.data_ready);
-        if (err)
-                goto read_exit;
+	err = wait_event_interruptible(dev->rwtq, dev->status.data_ready);
+	if (err)
+		goto read_exit;
 
-        spin_lock_irqsave(&(dev->rlock), flags);
+	spin_lock_irqsave(&(dev->rlock), flags);
 
 	if (count >= 128) {
 		err = hvc_p128_receive(dev->id, dev->ifno, buff);
-                if (! err) {
-                        dev->status.data_ready = 0;
-                        wmb();
-                        err = 128;
-                } else {
-                        pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
-                        err = -ENODEV;
-                }
+		if (! err) {
+			dev->status.data_ready = 0;
+			wmb();
+			err = 128;
+		} else {
+			pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
+			err = -ENODEV;
+		}
 	} else {
 		err = hvc_p128_receive(dev->id, dev->ifno, tmp);
 		if (! err) {
 			memcpy(buff, tmp, count);
-                        dev->status.data_ready = 0;
-                        wmb();
+			dev->status.data_ready = 0;
+			wmb();
 			err = count;
 		} else {
-                        pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, tmp, err);
+			pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, tmp, err);
 			err = -ENODEV;
-                }
+		}
 	}
 
-        spin_unlock_irqrestore(&(dev->rlock), flags);
+	spin_unlock_irqrestore(&(dev->rlock), flags);
 
 read_exit:
-        mutex_unlock(&(dev->rmux));
+	mutex_unlock(&(dev->rmux));
 
 	return err;
 }
@@ -202,29 +202,29 @@ read_exit:
 static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_t *pos)
 {
 	ssize_t err;
-        unsigned long flags;
+	unsigned long flags;
 	struct p128_device *dev;
 	uint64_t tmp[16];
 
 	dev = file->private_data;
 	err = mutex_lock_interruptible(&(dev->wmux));
-        if (err) 
+	if (err) 
 		return err;
 
-        err = wait_event_interruptible(dev->wwtq, dev->status.tx_empty);
-        if (err)
-                goto write_exit;
+	err = wait_event_interruptible(dev->wwtq, dev->status.tx_empty);
+	if (err)
+		goto write_exit;
 
-        spin_lock_irqsave(&(dev->wlock), flags);
+	spin_lock_irqsave(&(dev->wlock), flags);
 
 	if (count >= 128) {
 		err = hvc_p128_send(dev->id, dev->ifno, buff);
 		if (! err) {
-                        dev->status.tx_empty = 0;
-                        wmb();
+			dev->status.tx_empty = 0;
+			wmb();
 			err = 128;
-                } else {
-                        pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
+		} else {
+			pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
 			err = -ENODEV;
 		}
 	} else {
@@ -232,39 +232,39 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 		memcpy(tmp, buff, count);
 		err = hvc_p128_send(dev->id, dev->ifno, tmp);
 		if (! err) {
-                        dev->status.tx_empty = 0;
-                        wmb();
+			dev->status.tx_empty = 0;
+			wmb();
 			err = count;
 		} else {
-                        pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
+			pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
 			err = -ENODEV;
 		}
 	} 
 
-        spin_unlock_irqrestore(&(dev->wlock), flags);
+	spin_unlock_irqrestore(&(dev->wlock), flags);
 
 write_exit:
-        mutex_unlock(&(dev->wmux));
+	mutex_unlock(&(dev->wmux));
 
 	return err;
 }
 
 static __poll_t op_poll(struct file *filp, poll_table *wait)
 {
-        __poll_t flags;
-        struct p128_device *dev;
+	__poll_t flags;
+	struct p128_device *dev;
 
-        dev = filp->private_data;
-        poll_wait(filp, &(dev->rwtq), wait);
-        poll_wait(filp, &(dev->wwtq), wait);
+	dev = filp->private_data;
+	poll_wait(filp, &(dev->rwtq), wait);
+	poll_wait(filp, &(dev->wwtq), wait);
 
-        flags = 0;
-        if (dev->status.data_ready)
-                flags |= EPOLLIN | EPOLLRDNORM;
-        if (dev->status.tx_empty)
-                flags |= EPOLLOUT | EPOLLWRNORM;
+	flags = 0;
+	if (dev->status.data_ready)
+		flags |= EPOLLIN | EPOLLRDNORM;
+	if (dev->status.tx_empty)
+		flags |= EPOLLOUT | EPOLLWRNORM;
 
-        return flags;
+	return flags;
 }
 
 static void unregister_device(struct platform_device *pdev, struct p128 *p128, int ifno)
@@ -316,16 +316,16 @@ static int initialize_device(struct platform_device *pdev, struct p128 *p128, in
 	dev->status.data_ready = (status & P128_STS_DATA_READY) ? 1 : 0;
 	dev->status.tx_empty = (status & P128_STS_TX_EMPTY) ? 1 : 0;
 
-        mutex_init(&(dev->rmux));
-        mutex_init(&(dev->wmux));
+	mutex_init(&(dev->rmux));
+	mutex_init(&(dev->wmux));
 
-        init_waitqueue_head(&(dev->rwtq));
-        init_waitqueue_head(&(dev->wwtq));
+	init_waitqueue_head(&(dev->rwtq));
+	init_waitqueue_head(&(dev->wwtq));
 
-        spin_lock_init(&(dev->rlock));
-        spin_lock_init(&(dev->wlock));
+	spin_lock_init(&(dev->rlock));
+	spin_lock_init(&(dev->wlock));
 
-        return 0;
+	return 0;
 }
 
 static int register_device(struct platform_device *pdev, struct p128 *p128, int ifno)
