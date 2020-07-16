@@ -12,8 +12,10 @@
 #include <linux/interrupt.h>
 #include <linux/mutex.h>
 #include <linux/wait.h>
-#include <linux/spinlock.h>
 #include <linux/poll.h>
+#include <linux/of_irq.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include "hvc_p128.h"
 
 #define DRIVER_NAME		"hvcs-p128"
@@ -35,6 +37,8 @@ struct p128_device {
 	u32			id;
 	u16			ifno;
 	u16			irq;
+	u16			hwirq;
+	u32			intc;		/* a phandle */
 	struct {
 		char		data_ready;
 		char		tx_empty;
@@ -44,8 +48,6 @@ struct p128_device {
 	struct mutex		wmux;
 	struct wait_queue_head	rwtq;
 	struct wait_queue_head	wwtq;
-	spinlock_t		rlock;
-	spinlock_t		wlock;
 };
 
 struct p128 {
@@ -166,7 +168,7 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 	if (err)
 		goto read_exit;
 
-	spin_lock_irqsave(&(dev->rlock), flags);
+	local_irq_save(flags);
 
 	if (count >= 128) {
 		err = hvc_p128_receive(dev->id, dev->ifno, buff);
@@ -175,7 +177,7 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 			wmb();
 			err = 128;
 		} else {
-			pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
+			pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%px) -> %ld\n", dev->id, dev->ifno, buff, err);
 			err = -ENODEV;
 		}
 	} else {
@@ -186,12 +188,12 @@ static ssize_t op_read(struct file *file, char *buff, size_t count, loff_t *pos)
 			wmb();
 			err = count;
 		} else {
-			pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, tmp, err);
+			pr_err("hvc_p128_receive(id=0x%08x, ifno=%u, buff=%px) -> %ld\n", dev->id, dev->ifno, tmp, err);
 			err = -ENODEV;
 		}
 	}
 
-	spin_unlock_irqrestore(&(dev->rlock), flags);
+	local_irq_restore(flags);
 
 read_exit:
 	mutex_unlock(&(dev->rmux));
@@ -215,7 +217,7 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 	if (err)
 		goto write_exit;
 
-	spin_lock_irqsave(&(dev->wlock), flags);
+	local_irq_save(flags);
 
 	if (count >= 128) {
 		err = hvc_p128_send(dev->id, dev->ifno, buff);
@@ -224,7 +226,7 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 			wmb();
 			err = 128;
 		} else {
-			pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
+			pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%px) -> %ld\n", dev->id, dev->ifno, buff, err);
 			err = -ENODEV;
 		}
 	} else {
@@ -236,12 +238,12 @@ static ssize_t op_write(struct file *file, const char *buff, size_t count, loff_
 			wmb();
 			err = count;
 		} else {
-			pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%p) -> %ld\n", dev->id, dev->ifno, buff, err);
+			pr_err("hvc_p128_send(id=0x%08x, ifno=%u, buff=%px) -> %ld\n", dev->id, dev->ifno, buff, err);
 			err = -ENODEV;
 		}
 	} 
 
-	spin_unlock_irqrestore(&(dev->wlock), flags);
+	local_irq_restore(flags);
 
 write_exit:
 	mutex_unlock(&(dev->wmux));
@@ -292,7 +294,9 @@ static void unregister_devices(struct platform_device *pdev, struct p128 *p128)
 static int initialize_device(struct platform_device *pdev, struct p128 *p128, int ifno)
 {
 	int err;
+	u16 hwirq;
 	u32 status;
+	u32 intc;
 	struct p128_device *dev;
 
 	dev = &(p128->devices[ifno]);
@@ -303,8 +307,22 @@ static int initialize_device(struct platform_device *pdev, struct p128 *p128, in
 
 	dev->id = p128->id;
 	dev->ifno = ifno;
-	dev->irq = platform_get_irq(pdev, ifno);
-	pr_debug("%s%u.irq=%u\n", p128->name, ifno, dev->irq);
+
+	err = hvc_p128_get_interrupt_no(dev->id, dev->ifno, &hwirq);
+	if (err) {
+		pr_err("hvc_p128_get_interrupt_no(id=0x%08x, ifno=%u) -> %d\n", dev->id, dev->ifno, err);
+		return err;
+	}
+	dev->hwirq = hwirq - 32;
+	pr_debug("%s%u.hwirq=%u\n", p128->name, ifno, dev->hwirq);
+
+	err = of_property_read_u32(pdev->dev.of_node, "interrupt-parent", &intc);
+	if (err) {
+		pr_err("%s has no 'interrupt-parent' property.\n", p128->name);
+		return err;
+	}
+	dev->intc = intc;
+	pr_debug("%s%u.intc=%u\n", p128->name, ifno, intc);
 
 	err = hvc_p128_get_status(p128->id, ifno, &status);
 	if (err) {
@@ -322,9 +340,6 @@ static int initialize_device(struct platform_device *pdev, struct p128 *p128, in
 	init_waitqueue_head(&(dev->rwtq));
 	init_waitqueue_head(&(dev->wwtq));
 
-	spin_lock_init(&(dev->rlock));
-	spin_lock_init(&(dev->wlock));
-
 	return 0;
 }
 
@@ -333,6 +348,8 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 	int err;
 	dev_t devt;
 	struct p128_device *dev;
+	struct device_node *intc;
+	struct irq_fwspec fwspec;
 
 	err = initialize_device(pdev, p128, ifno);
 	if (err)
@@ -347,17 +364,41 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 		return err;
 	}
 
+	intc = of_find_node_by_phandle(dev->intc);
+	if (! intc) {
+		err = -ENODEV;
+		goto error;
+	}
+
+	fwspec.fwnode = of_node_to_fwnode(intc);
+	fwspec.param_count = 3;
+	fwspec.param[0] = 0;
+	fwspec.param[1] = dev->hwirq;
+	fwspec.param[2] = IRQF_TRIGGER_HIGH;
+	err = irq_create_fwspec_mapping(&fwspec);
+	if (err < 0) {
+		of_node_put(intc);
+		goto error;
+	}
+	dev->irq = err;
+	of_node_put(intc);
+	pr_debug("%s%u.irq=%u\n", p128->name, ifno, dev->irq);
+
 	err = devm_request_irq(dev->dev, dev->irq, irq_handler, IRQF_TRIGGER_HIGH, p128->name, dev);
 	if (err) {
 		pr_err("devm_request_irq(irq=%d) -> %d\n", dev->irq, err);
-		return err;
+		goto error;
 	}
 
 	dev->busy = 1;
 
-	pr_debug("%s%d is registered.\n", p128->name, ifno);
+	pr_info("%s%d is registered.\n", p128->name, ifno);
 
 	return 0;
+error:
+	device_destroy(p128->class, devt);
+
+	return err;
 }
 
 static int register_devices(struct platform_device *pdev, struct p128 *p128)
@@ -463,7 +504,7 @@ static int probe(struct platform_device *pdev, const char *name, u32 id)
 		return -ENODEV;		/* override the error code */
 	}
 
-	pr_info("%s: # of I/F = %d.\n", name, nr_ifs);
+	pr_info("# of I/F = %d.\n", nr_ifs);
 	if (nr_ifs == 0) {
 		return -ENODEV;
 	}
@@ -480,7 +521,6 @@ static int probe(struct platform_device *pdev, const char *name, u32 id)
 	}
 
 	list_add_tail(&(p128->list), &p128_list);
-	pr_info("add %p to the list.\n", p128);
 
 	return 0;
 }
@@ -491,8 +531,6 @@ static int p128_probe(struct platform_device *pdev)
 	u32 id;
 	const char *name;
 	struct fwnode_handle *fh;
-
-	pr_info("pdev=%p\n", pdev);
 
 	fh = dev_fwnode(&(pdev->dev));
 	err = fwnode_property_read_string(fh, "name", &name);
@@ -506,7 +544,7 @@ static int p128_probe(struct platform_device *pdev)
 		pr_err("property \"device-id\" is not available.\n");
 		return err;
 	}
-
+	
 	err = probe(pdev, name, id);
 
 	return err;
