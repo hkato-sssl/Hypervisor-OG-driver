@@ -357,7 +357,7 @@ static int register_device(struct platform_device *pdev, struct p128 *p128, int 
 
 	devt = MKDEV(p128->major, (p128->minor + ifno));
 	dev = &(p128->devices[ifno]);
-	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s%d", p128->name, ifno);
+	dev->dev = device_create(p128->class, &(pdev->dev), devt, dev, "%s-%d", p128->name, ifno);
 	if (IS_ERR(dev->dev)) {
 		pr_err("unable to create device %s%d\n", p128->name, ifno);
 		err = PTR_ERR(dev->dev);
@@ -449,7 +449,7 @@ static struct p128 *create_resources(struct platform_device *pdev, const char *n
 	p128->major = MAJOR(devt);
 	p128->minor = MINOR(devt);
 
-	p128->class = class_create(THIS_MODULE, name);
+	p128->class = class_create(name);
 	if (IS_ERR(p128->class)) {
 		err = PTR_ERR(p128->class);
 		pr_err("class_create() -> %d.\n", err);
@@ -504,7 +504,7 @@ static int probe(struct platform_device *pdev, const char *name, u32 id)
 		return -ENODEV;		/* override the error code */
 	}
 
-	pr_info("# of I/F = %d.\n", nr_ifs);
+	pr_info("Number of interfaces = %d.\n", nr_ifs);
 	if (nr_ifs == 0) {
 		return -ENODEV;
 	}
