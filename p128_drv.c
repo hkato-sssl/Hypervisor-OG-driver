@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * p128_drv.c
+ *
+ * (C) 2024 Hidekazu Kato
+ */
+
 #define pr_fmt(fmt) "%s: " fmt, KBUILD_MODNAME
 
 #include <linux/module.h>

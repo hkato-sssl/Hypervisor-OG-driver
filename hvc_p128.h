@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * hvc_p128.h
+ *
+ * (C) 2024 Hidekazu Kato
+ */
+
 #ifndef HYPERVISOR_HVC_P128
 #define HYPERVISOR_HVC_P128
 
